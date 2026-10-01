@@ -40,6 +40,7 @@ from .ns.topology import Topology, build_default_topology
 from .queue.confirm import Confirmation
 from .queue.queue import FillQueue
 from .queue.snapshot import QueueSnapshot
+from .readiness import CheckContext, ReadinessEvaluator
 from .sequence import fill_vehicle, pressurize_buffer, stop_fill, unload_truck
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
@@ -103,6 +104,10 @@ class Platform:
         self.leak_latch = LeakLatch(self.config.leak.hold_s)
         self.queue = FillQueue(self.config.queue)
         self.confirm = Confirmation(self.config.queue.confirm_timeout_s)
+        # 分级就绪：档位判据用站点统一配置，车型只决定全拒/降级。
+        self.readiness_evaluator = ReadinessEvaluator(
+            self.config.readiness, self.clock, self.bus, self.unit
+        )
 
         self._cycles = 0
         self._operations = 0
@@ -400,26 +405,166 @@ class Platform:
 
         return self.namespaces.resolve(address).as_dict()
 
-    def readiness(self) -> dict:
-        """汇总加注就绪判据，供控制台与巡检使用。"""
+    def _readiness_context(self, vehicle: str = DEFAULT_VEHICLE) -> CheckContext:
+        """汇总分级判据读取现场所需的全部组件。"""
 
-        fill_stage = self.topology.stage("fill")
+        return CheckContext(
+            running=self._running,
+            clock=self.clock,
+            nozzle=self.nozzle,
+            dispenser=self.dispenser,
+            precooler=self.precooler,
+            temperature=self.temperature,
+            leak_latch=self.leak_latch,
+            confirm=self.confirm,
+            queue=self.queue,
+            bank=self.bank,
+            baseline=self.baseline,
+            meter=self.meter,
+            trend=self.trend,
+            vehicle=vehicle,
+            max_line_pressure_mpa=self.config.dispenser.max_line_pressure_mpa,
+        )
+
+    def _readiness_legacy(self, evaluation: dict) -> dict:
+        """从同一份分级评估结果还原老接口字段，保证老调用方口径不变。"""
+
+        states: dict[str, dict] = {}
+        for tier in evaluation["tiers"]:
+            for check in tier["checks"]:
+                states[check["check"]] = check
+        for check in evaluation.get("extra_checks", []):
+            states.setdefault(check["check"], check)
+
+        def legacy_value(check: str) -> bool:
+            # 数据缺失按未就绪：与分级判定同口径，老布尔字段不会把缺失误判成真值。
+            return states.get(check, {}).get("status") == "ok"
+
         checks = {
-            "running": self._running,
-            "precool_ready": self.precooler.is_ready(),
-            "temperature_in_band": self.temperature.reached(),
-            "nozzle_latched": self.nozzle.is_latched(),
-            "leak_latch_clear": not self.leak_latch.is_engaged(self.clock.now()),
-            "confirm_idle": not self.confirm.pending(DEFAULT_VEHICLE),
+            "running": legacy_value("platform_running"),
+            "precool_ready": legacy_value("precool_ready"),
+            "temperature_in_band": legacy_value("temperature_in_band"),
+            "nozzle_latched": legacy_value("nozzle_latched"),
+            "leak_latch_clear": legacy_value("leak_clear"),
+            "confirm_idle": legacy_value("confirm_idle"),
         }
+        fill_stage = self.topology.stage("fill")
         recent = self.audit.tail(1)
         return {
             "ready": all(checks.values()),
             "checks": checks,
-            "stage": {"name": fill_stage.name, "label": fill_stage.label, "requires": list(self.topology.predecessors("fill"))},
+            "stage": {
+                "name": fill_stage.name,
+                "label": fill_stage.label,
+                "requires": list(self.topology.predecessors("fill")),
+            },
             "outstanding_confirms": self.confirm.outstanding(),
             "last_audit_ts": recent[-1]["ts"] if recent else None,
         }
+
+    def _readiness_report(
+        self,
+        vehicle_type: str,
+        vehicle: str,
+        *,
+        purpose: str,
+        emit_audit: bool,
+    ) -> dict:
+        """跑一次分级评估；只有显式就绪查询才落审计，快照轮询不刷流水。"""
+
+        return self.readiness_evaluator.evaluate(
+            self._readiness_context(vehicle),
+            vehicle_type=vehicle_type,
+            purpose=purpose,
+            emit_audit=emit_audit,
+        )
+
+    def readiness(self, vehicle_type: str = "default", vehicle: str = DEFAULT_VEHICLE) -> dict:
+        """汇总加注就绪判据，供控制台与巡检使用。
+
+        老字段（``ready/checks/stage/outstanding_confirms/last_audit_ts``）保持
+        原语义不变；分级结果在 ``tiers`` 段里，两者由同一次评估得出并落同一条
+        审计，避免总状态和分级状态互相打架。
+        """
+
+        with self._lock:
+            evaluation = self._readiness_report(
+                vehicle_type, vehicle, purpose="overview", emit_audit=True
+            )
+            legacy = self._readiness_legacy(evaluation)
+            return {
+                **legacy,
+                "vehicle_type": vehicle_type,
+                "vehicle": vehicle,
+                "policy": evaluation["policy"],
+                "profile_found": evaluation["profile_found"],
+                "partial_failure": evaluation["partial_failure"],
+                "all_tiers_ready": evaluation["all_ready"],
+                "ready_tiers": evaluation["ready_tiers"],
+                "allowed_tiers": evaluation["allowed_tiers"],
+                "highest_tier": evaluation["highest_tier"],
+                "tier_order": evaluation["order"],
+                "tiers": evaluation["tiers"],
+                "tier_extra_checks": evaluation["extra_checks"],
+                "tier_evaluated_ts": evaluation["ts"],
+            }
+
+    def readiness_tiers(
+        self,
+        vehicle_type: str = "default",
+        vehicle: str = DEFAULT_VEHICLE,
+    ) -> dict:
+        """分级就绪：逐档列出每条判据状态、未满足项与最近一次原因。"""
+
+        with self._lock:
+            evaluation = self._readiness_report(
+                vehicle_type, vehicle, purpose="tiers", emit_audit=True
+            )
+            return {
+                "station": self.unit,
+                "vehicle_type": vehicle_type,
+                "vehicle": vehicle,
+                "profile_found": evaluation["profile_found"],
+                "policy": evaluation["policy"],
+                "order": evaluation["order"],
+                "tiers": evaluation["tiers"],
+                "extra_checks": evaluation["extra_checks"],
+                "ready_tiers": evaluation["ready_tiers"],
+                "allowed_tiers": evaluation["allowed_tiers"],
+                "highest_tier": evaluation["highest_tier"],
+                "all_ready": evaluation["all_ready"],
+                "partial_failure": evaluation["partial_failure"],
+                "evaluated_ts": evaluation["ts"],
+                "check_states": self.readiness_evaluator.check_states(),
+            }
+
+    def readiness_gate(
+        self,
+        requested_tier: str,
+        purpose: str,
+        vehicle_type: str = "default",
+        vehicle: str = DEFAULT_VEHICLE,
+    ) -> dict:
+        """按车型策略对某个档位放行；全拒或降级由车型配置决定。"""
+
+        with self._lock:
+            evaluation = self.readiness_evaluator.gate(
+                self._readiness_context(vehicle),
+                vehicle_type=vehicle_type,
+                requested_tier=requested_tier,
+                purpose=purpose,
+            )
+            return {
+                "station": self.unit,
+                "vehicle_type": vehicle_type,
+                "vehicle": vehicle,
+                "gate": evaluation["gate"],
+                "tiers": evaluation["tiers"],
+                "allowed_tiers": evaluation["allowed_tiers"],
+                "highest_tier": evaluation["highest_tier"],
+                "partial_failure": evaluation["partial_failure"],
+                "evaluated_ts": evaluation["ts"],
+            }
 
     def cycle(self, dt: float = 1.0) -> dict:
         """推进一个控制周期，返回本周期摘要。"""
@@ -672,15 +817,37 @@ class Platform:
         }
 
     def snapshot(self) -> dict:
-        """返回只读的整体快照（状态 + 拓扑 + 命名空间 + 趋势）。"""
+        """返回只读的整体快照（状态 + 拓扑 + 命名空间 + 趋势 + 分级就绪）。"""
 
-        return {
-            "status": self.status(),
-            "topology": self.topology_summary(),
-            "namespaces": self.namespaces_describe(),
-            "trend": self.trend.snapshot(),
-            "readiness": self.readiness(),
-        }
+        with self._lock:
+            # 快照是控制台轮询入口，只读不刷审计；显式 /api/readiness 才落一条。
+            evaluation = self._readiness_report(
+                "default", DEFAULT_VEHICLE, purpose="snapshot", emit_audit=False
+            )
+            readiness = self._readiness_legacy(evaluation)
+            readiness.update(
+                {
+                    "vehicle_type": "default",
+                    "policy": evaluation["policy"],
+                    "profile_found": evaluation["profile_found"],
+                    "partial_failure": evaluation["partial_failure"],
+                    "all_tiers_ready": evaluation["all_ready"],
+                    "ready_tiers": evaluation["ready_tiers"],
+                    "allowed_tiers": evaluation["allowed_tiers"],
+                    "highest_tier": evaluation["highest_tier"],
+                    "tier_order": evaluation["order"],
+                    "tiers": evaluation["tiers"],
+                    "tier_extra_checks": evaluation["extra_checks"],
+                    "tier_evaluated_ts": evaluation["ts"],
+                }
+            )
+            return {
+                "status": self.status(),
+                "topology": self.topology_summary(),
+                "namespaces": self.namespaces_describe(),
+                "trend": self.trend.snapshot(),
+                "readiness": readiness,
+            }
 
 
 def build_platform(

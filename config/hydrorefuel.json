@@ -56,5 +56,113 @@
       "max_waiting": 12,
       "confirm_timeout_s": 45.0
     }
+  },
+  "readiness": {
+    "tiers": {
+      "receive": {
+        "label": "能收车",
+        "checks": [
+          "platform_running",
+          "leak_clear",
+          "queue_has_room",
+          "buffer_in_band",
+          "baseline_fresh"
+        ]
+      },
+      "valve_open": {
+        "label": "能开阀",
+        "checks": [
+          "platform_running",
+          "leak_clear",
+          "precool_ready",
+          "temperature_in_band",
+          "nozzle_latched",
+          "line_pressure_safe",
+          "confirm_idle"
+        ]
+      },
+      "handoff": {
+        "label": "能交接",
+        "checks": [
+          "platform_running",
+          "leak_clear",
+          "fill_valve_closed",
+          "nozzle_unseated",
+          "meter_has_reading"
+        ]
+      }
+    },
+    "vehicles": {
+      "default": {
+        "policy": "reject_all",
+        "tiers": {
+          "receive": {
+            "checks": [
+              "platform_running",
+              "leak_clear",
+              "queue_has_room",
+              "buffer_in_band",
+              "baseline_fresh"
+            ]
+          },
+          "valve_open": {
+            "checks": [
+              "platform_running",
+              "leak_clear",
+              "precool_ready",
+              "temperature_in_band",
+              "nozzle_latched",
+              "line_pressure_safe",
+              "confirm_idle"
+            ]
+          },
+          "handoff": {
+            "checks": [
+              "platform_running",
+              "leak_clear",
+              "fill_valve_closed",
+              "nozzle_unseated",
+              "meter_has_reading"
+            ]
+          }
+        },
+        "extra_checks": []
+      },
+      "citybus": {
+        "policy": "degrade",
+        "tiers": {
+          "receive": {
+            "checks": [
+              "platform_running",
+              "leak_clear",
+              "queue_has_room",
+              "buffer_in_band",
+              "baseline_fresh"
+            ]
+          },
+          "valve_open": {
+            "checks": [
+              "platform_running",
+              "leak_clear",
+              "precool_ready",
+              "temperature_in_band",
+              "nozzle_latched",
+              "line_pressure_safe",
+              "confirm_idle"
+            ]
+          },
+          "handoff": {
+            "checks": [
+              "platform_running",
+              "leak_clear",
+              "fill_valve_closed",
+              "nozzle_unseated",
+              "meter_has_reading"
+            ]
+          }
+        },
+        "extra_checks": ["buffer_pressure_fresh"]
+      }
+    }
   }
 }

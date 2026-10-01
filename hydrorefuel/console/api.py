@@ -40,7 +40,9 @@ class Api:
         add("GET", "/api/topology", lambda params, body: self._platform.topology_summary())
         add("GET", "/api/namespaces", lambda params, body: self._platform.namespaces_describe())
         add("GET", "/api/namespace/{address}", self._namespace)
-        add("GET", "/api/readiness", lambda params, body: self._platform.readiness())
+        add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/readiness/tiers", self._readiness_tiers)
+        add("GET", "/api/readiness/gate", self._readiness_gate)
         add("GET", "/api/truck", lambda params, body: {"truck": self._platform.truck_snapshot()})
         add("GET", "/api/vent", lambda params, body: {"vent": self._platform.vent_snapshot()})
         add("GET", "/api/compressor", lambda params, body: {"compressor": self._platform.compressor_snapshot()})
@@ -91,6 +93,30 @@ class Api:
             self._platform.note_error(error)
             return 409, {"error": type(error).__name__, **error.as_record()}
         return 200, payload
+
+    def _readiness(self, params: dict, body: dict) -> dict:
+        # 兼容老调用方：不带车型参数时按默认车型返回原有全部字段。
+        return self._platform.readiness(
+            vehicle_type=str(params.get("vehicle_type", "default")),
+            vehicle=str(params.get("vehicle", "vehicle01")),
+        )
+
+    def _readiness_tiers(self, params: dict, body: dict) -> dict:
+        return self._platform.readiness_tiers(
+            vehicle_type=str(params.get("vehicle_type", "default")),
+            vehicle=str(params.get("vehicle", "vehicle01")),
+        )
+
+    def _readiness_gate(self, params: dict, body: dict) -> dict:
+        tier = params.get("tier")
+        if not tier:
+            raise HydroError("放行判定缺少必填参数 tier", component="console")
+        return self._platform.readiness_gate(
+            requested_tier=str(tier),
+            purpose=str(params.get("purpose", "request")),
+            vehicle_type=str(params.get("vehicle_type", "default")),
+            vehicle=str(params.get("vehicle", "vehicle01")),
+        )
 
     def _namespace(self, params: dict, body: dict) -> dict:
         return {"device": self._platform.namespace(str(params.get("address", "")))}
