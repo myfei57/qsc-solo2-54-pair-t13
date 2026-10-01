@@ -23,7 +23,7 @@ from .config import config_to_mapping, default_config, load_config
 from .console.server import ConsoleServer, probe_endpoints
 from .errors import HydroError
 
-DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/topology", "/api/audit")
+DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/readiness/tiers", "/api/topology", "/api/audit")
 
 
 def _build(args: argparse.Namespace) -> Platform:

@@ -55,6 +55,16 @@
     "queue": {
       "max_waiting": 12,
       "confirm_timeout_s": 45.0
+    },
+    "readiness": {
+      "default": {
+        "on_failure": "degraded"
+      },
+      "vehicle_types": {
+        "heavy_truck": {
+          "on_failure": "strict"
+        }
+      }
     }
   }
 }

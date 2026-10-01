@@ -40,6 +40,9 @@ from .ns.topology import Topology, build_default_topology
 from .queue.confirm import Confirmation
 from .queue.queue import FillQueue
 from .queue.snapshot import QueueSnapshot
+from .readiness import decide as decide_tiers
+from .readiness import evaluate as evaluate_tiers
+from .readiness.snapshot import TierSnapshot
 from .sequence import fill_vehicle, pressurize_buffer, stop_fill, unload_truck
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
@@ -51,6 +54,16 @@ from .vent.valve import VentValve
 
 DEFAULT_UNIT = "station1"
 DEFAULT_VEHICLE = "vehicle01"
+
+# 旧版总就绪接口保留的判据项（键名与顺序都不能动，老调用方按这些键取数）。
+LEGACY_READINESS_CHECKS = (
+    "running",
+    "precool_ready",
+    "temperature_in_band",
+    "nozzle_latched",
+    "leak_latch_clear",
+    "confirm_idle",
+)
 
 
 class Platform:
@@ -400,18 +413,56 @@ class Platform:
 
         return self.namespaces.resolve(address).as_dict()
 
+    def _readiness_probes(self) -> dict:
+        """把各就绪判据的数据源汇成探测表，评估核心只读这张表。
+
+        全部用 lambda 包一层：取值延迟到评估时执行，组件异常才会被评估
+        核心捕获并按数据缺失处理，而不是在建表时直接抛出。
+        """
+
+        now = self.clock.now()
+        return {
+            "running": lambda: self._running,
+            "queue_has_capacity": lambda: self.queue.size() < self.config.queue.max_waiting,
+            "confirm_idle": lambda: not self.confirm.outstanding(),
+            "precool_ready": lambda: self.precooler.is_ready(),
+            "temperature_in_band": lambda: self.temperature.reached(),
+            "nozzle_latched": lambda: self.nozzle.is_latched(),
+            "leak_latch_clear": lambda: not self.leak_latch.is_engaged(now),
+            "dispenser_idle": lambda: not self.dispenser.is_filling()
+            and not self.dispenser.fill_valve_open(),
+        }
+
+    def _last_event_for(self, component: str) -> dict | None:
+        """取某组件最近一次告警档审计记录，作为判据不满足的最近原因。"""
+
+        for entry in self.audit.entries(limit=200):
+            if entry["component"] == component and entry["severity"] in ("warning", "alarm"):
+                return {
+                    "ts": entry["ts"],
+                    "action": entry["action"],
+                    "severity": entry["severity"],
+                    "message": entry["message"],
+                }
+        return None
+
+    def _evaluate_readiness(self) -> tuple[TierSnapshot, ...]:
+        """用共享评估核心算出各档就绪（不写审计，供新旧接口共用）。"""
+
+        return evaluate_tiers(self._readiness_probes(), self._last_event_for)
+
     def readiness(self) -> dict:
-        """汇总加注就绪判据，供控制台与巡检使用。"""
+        """汇总加注就绪判据，供控制台与巡检使用。
+
+        返回结构保持旧版不变；判据取值与分级就绪共用同一个评估核心，
+        两侧结论不会分叉。
+        """
 
         fill_stage = self.topology.stage("fill")
-        checks = {
-            "running": self._running,
-            "precool_ready": self.precooler.is_ready(),
-            "temperature_in_band": self.temperature.reached(),
-            "nozzle_latched": self.nozzle.is_latched(),
-            "leak_latch_clear": not self.leak_latch.is_engaged(self.clock.now()),
-            "confirm_idle": not self.confirm.pending(DEFAULT_VEHICLE),
+        evaluated = {
+            check.name: check for tier in self._evaluate_readiness() for check in tier.checks
         }
+        checks = {name: evaluated[name].ok for name in LEGACY_READINESS_CHECKS}
         recent = self.audit.tail(1)
         return {
             "ready": all(checks.values()),
@@ -420,6 +471,49 @@ class Platform:
             "outstanding_confirms": self.confirm.outstanding(),
             "last_audit_ts": recent[-1]["ts"] if recent else None,
         }
+
+    def tiered_readiness(self, vehicle_type: str | None = None) -> dict:
+        """按车型评估分级就绪，落审计后返回结果。
+
+        控制台展示与审计记录用的是同一份评估结果；不满足时按车型策略
+        决定全拒（``rejected``）还是给出可做的档位（``degraded``）。
+        """
+
+        with self._lock:
+            policy = self.config.readiness.policy_for(vehicle_type)
+            tiers = self._evaluate_readiness()
+            outcome = decide_tiers(tiers, policy.on_failure)
+            result = {
+                "vehicle_type": vehicle_type or "default",
+                "policy": policy.on_failure,
+                **outcome,
+                "tiers": [tier.as_dict() for tier in tiers],
+                "evaluated_at": round(self.clock.now(), 3),
+            }
+            messages = {
+                "ready": "分级就绪：全部档位就绪",
+                "degraded": "分级就绪：部分档位可做",
+                "rejected": "分级就绪：按车型策略全拒",
+            }
+            self.bus.publish(
+                Event.of(
+                    "readiness",
+                    "readiness",
+                    "tiered_readiness",
+                    station=self.unit,
+                    severity="notice" if outcome["ready"] else "warning",
+                    message=messages[outcome["decision"]],
+                    vehicle_type=result["vehicle_type"],
+                    policy=result["policy"],
+                    ready=outcome["ready"],
+                    decision=outcome["decision"],
+                    allowed_tiers=list(outcome["allowed_tiers"]),
+                    failed_tiers=list(outcome["failed_tiers"]),
+                    data_missing=outcome["data_missing"],
+                    tiers=result["tiers"],
+                )
+            )
+            return result
 
     def cycle(self, dt: float = 1.0) -> dict:
         """推进一个控制周期，返回本周期摘要。"""

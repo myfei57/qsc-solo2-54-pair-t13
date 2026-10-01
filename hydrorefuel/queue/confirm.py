@@ -75,6 +75,6 @@ class Confirmation:
 
         with self._lock:
             return sorted(
-                (vehicle for vehicle in self._pending if vehicle not in self._confirmed),
+                (vehicle for vehicle in self._pending if self.pending(vehicle)),
                 key=lambda vehicle: self._pending[vehicle],
             )

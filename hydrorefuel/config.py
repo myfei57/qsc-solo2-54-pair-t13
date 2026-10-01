@@ -2,8 +2,9 @@
 
 配置来自 JSON 文件（标准库解析），覆盖槽车卸氢压力与放散确认阈值、压缩机
 入口与目标压力、瓶组压力带与基线有效期、预冷目标温度、流量阶梯公差、加注
-枪落座行程、泄漏阀值与加注队列容量。任何缺失或越界取值都在装配阶段抛出
-:class:`ConfigError`，不允许带着半份配置启动控制链。
+枪落座行程、泄漏阀值、加注队列容量，以及按车型配置的分级就绪失败策略。
+任何缺失或越界取值都在装配阶段抛出 :class:`ConfigError`，不允许带着半份
+配置启动控制链。
 """
 
 from __future__ import annotations
@@ -274,6 +275,79 @@ class QueueLimits:
         )
 
 
+STRICT = "strict"
+DEGRADED = "degraded"
+ON_FAILURE_MODES = (STRICT, DEGRADED)
+
+
+@dataclass(frozen=True)
+class ReadinessPolicy:
+    """单个车型的分级就绪失败策略。
+
+    ``on_failure`` 取 ``strict``（任一档位不满足即全拒）或 ``degraded``
+    （不满足时仍给出当前可做的档位）。
+    """
+
+    on_failure: str
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "ReadinessPolicy":
+        mode = section.get("on_failure", _MISSING)
+        if mode is _MISSING:
+            raise ConfigError("分级就绪策略缺少字段 'on_failure'", component="config")
+        if mode not in ON_FAILURE_MODES:
+            raise ConfigError(
+                f"分级就绪失败策略必须是 {ON_FAILURE_MODES} 之一",
+                component="config",
+            )
+        return cls(on_failure=str(mode))
+
+
+@dataclass(frozen=True)
+class ReadinessLimits:
+    """分级就绪策略表。
+
+    策略按车型配置（不按站点统一一份）：``vehicle_types`` 以车型为键，
+    未列出的车型回落到 ``default`` 兜底策略。
+    """
+
+    default: ReadinessPolicy
+    vehicle_types: dict[str, ReadinessPolicy]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "ReadinessLimits":
+        default_raw = section.get("default", _MISSING)
+        if default_raw is _MISSING:
+            raise ConfigError("分级就绪配置缺少 'default' 策略", component="config")
+        if not isinstance(default_raw, Mapping):
+            raise ConfigError("分级就绪 'default' 策略必须是映射", component="config")
+        types_raw = section.get("vehicle_types", {})
+        if not isinstance(types_raw, Mapping):
+            raise ConfigError("分级就绪 'vehicle_types' 必须是映射", component="config")
+        vehicle_types: dict[str, ReadinessPolicy] = {}
+        for name, raw in types_raw.items():
+            if not isinstance(name, str) or not name:
+                raise ConfigError("车型名必须是非空字符串", component="config")
+            if name == "default":
+                raise ConfigError("车型名 'default' 保留给兜底策略", component="config")
+            if not isinstance(raw, Mapping):
+                raise ConfigError(f"车型 {name!r} 的就绪策略必须是映射", component="config")
+            vehicle_types[name] = ReadinessPolicy.from_mapping(raw)
+        return cls(
+            default=ReadinessPolicy.from_mapping(default_raw),
+            vehicle_types=vehicle_types,
+        )
+
+    def policy_for(self, vehicle_type: str | None) -> ReadinessPolicy:
+        """按车型取失败策略；未配置的车型回落到 ``default``。"""
+
+        if vehicle_type:
+            policy = self.vehicle_types.get(vehicle_type)
+            if policy is not None:
+                return policy
+        return self.default
+
+
 @dataclass(frozen=True)
 class StationConfig:
     """一份完整的平台配置。"""
@@ -289,6 +363,7 @@ class StationConfig:
     dispenser: DispenserLimits
     leak: LeakLimits
     queue: QueueLimits
+    readiness: ReadinessLimits
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "StationConfig":
@@ -313,6 +388,7 @@ class StationConfig:
             dispenser=DispenserLimits.from_mapping(_section(limits, "disp")),
             leak=LeakLimits.from_mapping(_section(limits, "leak")),
             queue=QueueLimits.from_mapping(_section(limits, "queue")),
+            readiness=ReadinessLimits.from_mapping(_section(limits, "readiness")),
         )
 
 
@@ -343,6 +419,10 @@ def default_config() -> StationConfig:
         dispenser=DispenserLimits(55.0, 15.0, 44.0, 2.0),
         leak=LeakLimits(4000.0, 5.0, 30.0),
         queue=QueueLimits(12, 45.0),
+        readiness=ReadinessLimits(
+            default=ReadinessPolicy(DEGRADED),
+            vehicle_types={"heavy_truck": ReadinessPolicy(STRICT)},
+        ),
     )
 
 
@@ -403,6 +483,13 @@ def config_to_mapping(cfg: StationConfig) -> dict:
             "queue": {
                 "max_waiting": cfg.queue.max_waiting,
                 "confirm_timeout_s": cfg.queue.confirm_timeout_s,
+            },
+            "readiness": {
+                "default": {"on_failure": cfg.readiness.default.on_failure},
+                "vehicle_types": {
+                    name: {"on_failure": policy.on_failure}
+                    for name, policy in cfg.readiness.vehicle_types.items()
+                },
             },
         },
     }

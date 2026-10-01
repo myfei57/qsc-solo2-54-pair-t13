@@ -41,6 +41,7 @@ class Api:
         add("GET", "/api/namespaces", lambda params, body: self._platform.namespaces_describe())
         add("GET", "/api/namespace/{address}", self._namespace)
         add("GET", "/api/readiness", lambda params, body: self._platform.readiness())
+        add("GET", "/api/readiness/tiers", self._readiness_tiers)
         add("GET", "/api/truck", lambda params, body: {"truck": self._platform.truck_snapshot()})
         add("GET", "/api/vent", lambda params, body: {"vent": self._platform.vent_snapshot()})
         add("GET", "/api/compressor", lambda params, body: {"compressor": self._platform.compressor_snapshot()})
@@ -94,6 +95,10 @@ class Api:
 
     def _namespace(self, params: dict, body: dict) -> dict:
         return {"device": self._platform.namespace(str(params.get("address", "")))}
+
+    def _readiness_tiers(self, params: dict, body: dict) -> dict:
+        vehicle_type = params.get("vehicle_type") or None
+        return self._platform.tiered_readiness(vehicle_type=vehicle_type)
 
     def _audit(self, params: dict, body: dict) -> dict:
         return {"entries": self._platform.audit.entries(limit=int(params.get("limit", 100)))}
